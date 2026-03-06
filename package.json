@@ -1,0 +1,9 @@
+{
+  "name": "rabbit-setup",
+  "scripts": {
+    "start": "node setup.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.3"
+  }
+}
