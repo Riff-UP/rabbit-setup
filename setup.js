@@ -5,76 +5,125 @@ const EXCHANGE_TYPE = 'topic';
 const QUEUES = [
   {
     name: 'notifications_queue',
-    bindings: ['auth.tokenGenerated', 'post.created', 'event.*', 'send.resetPassword',
-    'follow.*'],
+    bindings: [
+      'auth.tokenGenerated',
+      'post.created',
+      'event.*',
+      'send.resetPassword',
+      'follow.*',
+    ],
   },
   {
     name: 'content_queue',
-    bindings: ['auth.tokenGenerated', 'post.created', 'event.created',
-        'event.updated', 'event.cancelled', 'follow.*'],
+    bindings: [
+      'auth.tokenGenerated',
+      'post.created',
+      'event.created',
+      'event.updated',
+      'event.cancelled',
+      'follow.*',
+    ],
   },
   { name: 'users_queue', bindings: ['user.*', 'auth.tokenGenerated'] },
-  // add more queues/bindings as needed
 ];
 
-// Helper: sleep por ms
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Intentos de conexión con backoff exponencial
+function parsePositiveInt(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
 async function connectWithRetry(url, opts = {}) {
-  const maxAttempts = opts.maxAttempts || 10;
-  const initialDelay = opts.initialDelay || 2000; // ms
+  const maxAttempts = parsePositiveInt(opts.maxAttempts, 10);
+  const initialDelay = parsePositiveInt(opts.initialDelay, 2000);
+
+  if (!url) {
+    throw new Error('RABBIT_URL no esta definido');
+  }
 
   let attempt = 0;
+  let lastErr;
+
   while (attempt < maxAttempts) {
+    attempt += 1;
     try {
-      attempt += 1;
       if (attempt > 1) {
         console.log(`Rabbit connect: intento ${attempt}/${maxAttempts}`);
       }
-      // directly return the connection promise to avoid a redundant local variable
       return await amqp.connect(url);
     } catch (err) {
-      console.warn(`Conexión a Rabbit falló en intento ${attempt + 1}: ${err.message || err}`);
-      attempt += 1;
+      lastErr = err;
+      console.warn(
+        `Conexion a Rabbit fallo en intento ${attempt}/${maxAttempts}: ${err?.message || err}`
+      );
+
       if (attempt >= maxAttempts) {
-        throw new Error(`No se pudo conectar a RabbitMQ tras ${maxAttempts} intentos: ${err && err.message}`);
+        break;
       }
+
       const delay = initialDelay * Math.pow(2, attempt - 1);
-      // No exceder 30s de espera entre intentos
       const finalDelay = Math.min(delay, 30000);
       await sleep(finalDelay);
     }
   }
-  throw new Error('connectWithRetry: reached unreachable code');
+
+  throw new Error(
+    `No se pudo conectar a RabbitMQ tras ${maxAttempts} intentos: ${lastErr?.message || lastErr}`
+  );
 }
 
 async function setupRabbit() {
-  // Configurables vía entorno (opcionales)
-  const maxAttemptsEnv = process.env.RABBIT_SETUP_MAX_ATTEMPTS ? parseInt(process.env.RABBIT_SETUP_MAX_ATTEMPTS, 10) : undefined;
-  const initialDelayEnv = process.env.RABBIT_SETUP_INITIAL_DELAY ? parseInt(process.env.RABBIT_SETUP_INITIAL_DELAY, 10) : undefined;
+  const rabbitUrl = process.env.RABBIT_URL;
+  const maxAttempts = parsePositiveInt(
+    process.env.RABBIT_SETUP_MAX_ATTEMPTS,
+    8
+  );
+  const initialDelay = parsePositiveInt(
+    process.env.RABBIT_SETUP_INITIAL_DELAY,
+    2000
+  );
 
-  const maxAttempts = Number.isInteger(maxAttemptsEnv) ? maxAttemptsEnv : 8;
-  const initialDelay = Number.isInteger(initialDelayEnv) ? initialDelayEnv : 2000;
-
-  // Usar connectWithRetry para tolerar arranques lentos del broker
-  const conn = await connectWithRetry(process.env.RABBIT_URL, { maxAttempts, initialDelay });
-  const ch = await conn.createChannel();
-
-  await ch.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
-
-  for (const q of QUEUES) {
-    await ch.assertQueue(q.name, { durable: true });
-    for (const rk of q.bindings) {
-      await ch.bindQueue(q.name, EXCHANGE, rk);
-    }
+  if (!rabbitUrl) {
+    throw new Error('Falta RABBIT_URL en variables de entorno');
   }
 
-  await ch.close();
-  await conn.close();
-  console.log('Rabbit setup completed: exchange + queues + bindings created');
+  let conn;
+  let ch;
+
+  try {
+    conn = await connectWithRetry(rabbitUrl, { maxAttempts, initialDelay });
+    ch = await conn.createChannel();
+
+    await ch.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
+
+    for (const q of QUEUES) {
+      await ch.assertQueue(q.name, { durable: true });
+      for (const rk of q.bindings) {
+        await ch.bindQueue(q.name, EXCHANGE, rk);
+      }
+    }
+
+    console.log('Rabbit setup completed: exchange + queues + bindings created');
+  } finally {
+    if (ch) {
+      try {
+        await ch.close();
+      } catch (e) {
+        console.warn(`No se pudo cerrar canal Rabbit: ${e?.message || e}`);
+      }
+    }
+
+    if (conn) {
+      try {
+        await conn.close();
+      } catch (e) {
+        console.warn(`No se pudo cerrar conexion Rabbit: ${e?.message || e}`);
+      }
+    }
+  }
 }
 
 if (require.main === module) {
